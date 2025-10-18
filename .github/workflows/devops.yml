@@ -1,27 +1,36 @@
-name: CI básico Python + Bash
-run-name: "CI disparado por ${{ github.actor }}"
+name: CI/CD → ECR
+run-name: "${{ github.actor }} publicó a ECR en ${{ github.ref_name }}"
 
 on:
   push:
     branches: [ main ]
   pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: "3.11"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  ECR_REPO_NAME: ${{ vars.ECR_REPO_NAME }}
 
 jobs:
-  # JOB 1: Validación (Python) — corre en Ubuntu hospedado por GitHub
+  docs:
+  
+  package:
+
   test:
     runs-on: ubuntu-latest
+    outputs:
+      build_tag: ${{ steps.meta.outputs.tag }}
     steps:
-      # STEP: Trae el código al runner
       - name: Checkout
         uses: actions/checkout@v4
 
-      # STEP: Configura Python (action oficial)
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      # STEP: (Opcional) Cache de dependencias para acelerar
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -29,112 +38,64 @@ jobs:
           key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
           restore-keys: pip-${{ runner.os }}-
 
-      # STEP: Instala dependencias (Bash)
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # STEP: Ejecuta pruebas (Bash llamando a Python)
       - name: Run tests
         run: |
           export PYTHONPATH="${PYTHONPATH}:$(pwd)"
           pytest -q
 
-      # STEP: Crear un “output” del job usando GITHUB_OUTPUT (Bash)
       - name: Compute build tag
         id: meta
         run: |
           TS=$(date +%Y%m%d-%H%M%S)
           echo "tag=${TS}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      # STEP: Publicar un artefacto con el reporte (ejemplo)
-      - name: Save artifact (sample log)
-        run: |
-          echo "Build tag: ${{ steps.meta.outputs.tag }}" > build-info.txt
-      - name: Upload build info artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-info
-          path: build-info.txt
-
-  # JOB 2: Empaquetado (Bash) — depende del job de tests (secuencial)
-  package:
+  docker-ecr:
     needs: test
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # STEP: Usar el output del job anterior
-      - name: Read tag from previous job
-        run: echo "TAG = ${{ needs.test.outputs.meta_tag }}"
-        env:
-          # Exponemos el output del step meta como output de job usando needs.<job>.outputs.<name>
-          # Para eso definimos outputs del job test abajo (ver 'outputs:' en job test)
-          TAG: ${{ needs.test.outputs.build_tag }}
-
-      # STEP: Crear artefacto zip (Bash puro)
-      - name: Create zip
-        run: |
-          mkdir -p dist
-          cp hello.py dist/
-          zip -r "dist/app-${{ needs.test.outputs.build_tag }}.zip" dist
-
-      - name: Upload package
-        uses: actions/upload-artifact@v4
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          name: app-zip
-          path: dist/*.zip
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  # JOB 3: Tareas rápidas en paralelo (Bash) — NO depende de nadie
-  docs:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Echo info (Bash)
+      - name: Ensure ECR repository exists
         run: |
-          echo "Repo: $GITHUB_REPOSITORY"
-          echo "Evento: $GITHUB_EVENT_NAME"
-          echo "Runner: $RUNNER_OS"
+          aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" >/dev/null 2>&1 ||           aws ecr create-repository --repository-name "$ECR_REPO_NAME"             --image-scanning-configuration scanOnPush=true             --encryption-configuration encryptionType=AES256
 
-  # ========================================
-  # JOB 4: DOCKER (🆕 NUEVO)
-  # ========================================
-  docker:
-    needs: test  # Espera a que test termine exitosamente
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'  # Solo en push a main
-    
-    steps:
-      # STEP 1: Checkout del código
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # STEP 2: Setup Docker Buildx (mejora el build de imágenes)
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # STEP 3: Login a Docker Hub
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # STEP 4: Extraer metadata para tags
-      - name: Extract metadata (tags, labels)
+      - name: Extract Docker metadata (tags/labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/github-actions-demo
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_NAME }}
           tags: |
             type=ref,event=branch
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ needs.test.outputs.build_tag }}
 
-      # STEP 5: Build y Push de la imagen Docker
-      - name: Build and push Docker image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Push image to ECR
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -142,21 +103,15 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/github-actions-demo:buildcache
-          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/github-actions-demo:buildcache,mode=max
+          cache-from: type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO_NAME }}:buildcache,mode=max
 
-      # STEP 6: Generar resumen del build
-      - name: Image summary
+      - name: Summary
         run: |
-          echo "## 🐳 Docker Build Exitoso" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Imagen publicada:**" >> $GITHUB_STEP_SUMMARY
+          echo "## 🐳 Publicación exitosa en AWS ECR" >> $GITHUB_STEP_SUMMARY
+          echo "**Registro:** ${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Repositorio:** $ECR_REPO_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ secrets.DOCKERHUB_USERNAME }}/github-actions-demo:latest" >> $GITHUB_STEP_SUMMARY
-          echo "${{ secrets.DOCKERHUB_USERNAME }}/github-actions-demo:${{ needs.test.outputs.build_tag }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Pull de la imagen:**" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/github-actions-demo:latest" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
