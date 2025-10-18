@@ -14,10 +14,6 @@ env:
   ECR_REPO_NAME: ${{ vars.ECR_REPO_NAME }}
 
 jobs:
-  docs:
-  
-  package:
-
   test:
     runs-on: ubuntu-latest
     outputs:
